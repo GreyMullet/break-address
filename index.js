@@ -17,31 +17,13 @@ const DADATA_URL = 'https://cleaner.dadata.ru/api/v1/clean/address';
 
 // --- Вспомогательные функции ---
 
-// Достаём индекс напрямую из строки, если DaData его не вернула.
-// Российский индекс — ровно 6 цифр, не являющихся частью более длинного числа.
-function extractIndexFallback(str) {
-    const match = str.match(/(?<!\d)\d{6}(?!\d)/);
-    return match ? match[0] : null;
+// Проверяем, начинается ли строка с индекса (5-6 цифр, опционально запятая)
+function hasIndex(input) {
+    return /^\s*\d{5,6}\s*(?:,|$)/.test(input.trim());
 }
 
-// Пытаемся вытащить номер участка ("з/у 1", "уч. 5", "участок №3") из
-// неразобранного DaData хвоста строки.
-function extractPlotNumber(unparsedParts) {
-    if (!unparsedParts) return null;
-    const match = unparsedParts.match(
-        /(?:з\/у|зу|уч(?:асток)?|надел)\.?\s*№?\s*(\d+[а-яёА-ЯЁ]?)/i
-    );
-    return match ? match[1] : null;
-}
-
-// То же самое, но как последний fallback — ищем паттерн участка прямо
-// в исходной строке (на случай если DaData вообще не вернула unparsed_parts).
-function extractPlotNumberFromSource(str) {
-    return extractPlotNumber(str);
-}
-
-// Формируем номер дома / участка из полей DaData, с fallback на "голый" участок
-function formatHouse(data, sourceStr) {
+// Формируем номер дома / участка из полей DaData
+function formatHouse(data) {
     const parts = [];
     if (data.house_type && data.house) {
         parts.push(`${data.house_type} ${data.house}`);
@@ -60,20 +42,7 @@ function formatHouse(data, sourceStr) {
     if (data.flat) {
         parts.push(`кв${data.flat}`);
     }
-
-    if (parts.length) {
-        return parts.join(' ');
-    }
-
-    // DaData не распознала дом/участок как отдельное поле — ищем цифру
-    // сначала в её "неразобранном хвосте", потом прямо в исходной строке.
-    const plotFromUnparsed = extractPlotNumber(data.unparsed_parts);
-    if (plotFromUnparsed) return plotFromUnparsed;
-
-    const plotFromSource = extractPlotNumberFromSource(sourceStr);
-    if (plotFromSource) return plotFromSource;
-
-    return null;
+    return parts.length ? parts.join(' ') : null;
 }
 
 // Формируем регион: "Краснодарский край"
@@ -90,14 +59,6 @@ function formatCity(data) {
         return `${data.city_type} ${data.city}`;
     }
     return data.city || null;
-}
-
-// Формируем район: "Первомайский р-н"
-function formatDistrict(data) {
-    if (data.area_type && data.area) {
-        return `${data.area} ${data.area_type}`;
-    }
-    return data.area || null;
 }
 
 // --- Эндпоинт ---
@@ -127,23 +88,20 @@ app.post('/break-address', async (req, res) => {
         );
 
         const data = response.data[0];
+        if (!data) {
+            return res.status(404).json({ error: 'Address not recognized' });
+        }
 
-        // Если DaData вообще ничего не вернула по строке (например, строка
-        // состоит из одного индекса) — не валим запрос ошибкой 404, а даём
-        // fallback-логике ниже шанс собрать хоть что-то из исходной строки.
-        const safeData = data || {};
-
-        // Индекс: сперва то, что распознала DaData, иначе — вытаскиваем
-        // 6-значное число прямо из исходной строки.
-        const index = safeData.postal_code || extractIndexFallback(str);
+        // Индекс возвращаем только если он был в исходной строке
+        const includeIndex = hasIndex(str);
 
         const result = {
-            index: index || null,
-            region: formatRegion(safeData),
-            district: formatDistrict(safeData),
-            city: formatCity(safeData),
-            street: safeData.street || null,
-            address: formatHouse(safeData, str)
+            index: includeIndex ? data.postal_code : null,
+            region: formatRegion(data),
+            district: data.area || null,
+            city: formatCity(data),
+            street: data.street || null,
+            address: formatHouse(data) // только номер / участок
         };
 
         res.json(result);
