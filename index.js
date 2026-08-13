@@ -15,35 +15,31 @@ app.post('/break-address', (req, res)=>{
         return res.status(400).json({ error: 'Missing "str" field' })
     }
 
-    const splitedStr=str.split(',').map(el => el.trim())
-    const first=splitedStr[0] || ''
-    const second=splitedStr[1] || ''
-    const third=splitedStr[2] || ''
-    const fourth=splitedStr[3] || ''
-    const fifth=splitedStr[4] || ''
-    const sixths=splitedStr[5] || ''
-    const seventh=splitedStr[6] || ''
+    const parts=str.split(',').map(el => el.trim())
+    const first=parts[0] || ''
+    const isIndex=/^\d+$/.test(first)
 
-    const testFirst=/^\d+$/.test(first)
+    let country, index, region, district, city, street, address
 
-    const country=(first && !testFirst) ? first : ''
-    const index=(second && !testFirst) ? second : splitedStr[0]
-    const region=(third && !testFirst) ? third : splitedStr[1]
-    const district=(fourth && !testFirst) ? fourth : splitedStr[2]
-    const city=(fifth && !testFirst) ? fifth : splitedStr[3]
-    const street=(sixths && !testFirst) ? sixths : splitedStr[4]
-    const address=(seventh && !testFirst) ? seventh : splitedStr[5]
+    if (isIndex){
+        country=''
+        index=first
+        region=parts[1] || ''
+        district=parts[2] || ''
+        city=parts[3] || ''
+        street=parts[4] || ''
+        address=parts[5] || ''
+    } else{
+        country=first
+        index=parts[1] || ''
+        region=parts[2] || ''
+        district=parts[3] || ''
+        city=parts[4] || ''
+        street=parts[5] || ''
+        address=parts[6] || ''
+    }
 
-    const result={
-        country: country,
-        index: index,
-        region: region,
-        district: district,
-        city: city,
-        street: street,
-        address: address
-    };
-
+    const result={ country, index, region, district, city, street, address }
     res.json(result)
 })
 
