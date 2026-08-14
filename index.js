@@ -1,117 +1,257 @@
-require('dotenv').config();
-const path = require('path');
-const express = require('express');
-const axios = require('axios');
+require('dotenv').config()
+const path=require('path')
+const express=require('express')
+const axios=require('axios')
 
-const app = express();
-const PORT = process.env.PORT ?? 3000;
+const app=express()
+const PORT=process.env.PORT ?? 3000
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json())
+app.use(express.urlencoded({ extended: true }))
+app.use(express.static(path.join(__dirname, 'public')))
 
-// --- Конфигурация DaData ---
-const DADATA_API_KEY = process.env.DADATA_API_KEY;
-const DADATA_SECRET_KEY = process.env.DADATA_SECRET_KEY;
-const DADATA_URL = 'https://cleaner.dadata.ru/api/v1/clean/address';
+const AI_PROVIDER=process.env.AI_PROVIDER || 'mistral'
 
-// --- Вспомогательные функции ---
+// --- Mistral ---
+const MISTRAL_API_KEY=process.env.MISTRAL_API_KEY
+const MISTRAL_MODEL=process.env.MISTRAL_MODEL || 'mistral-small-latest'
+const MISTRAL_URL='https://api.mistral.ai/v1/chat/completions'
 
-// Проверяем, начинается ли строка с индекса (5-6 цифр, опционально запятая)
-function hasIndex(input) {
-    return /^\s*\d{5,6}\s*(?:,|$)/.test(input.trim());
+// --- OpenRouter ---
+const OPENROUTER_API_KEY=process.env.OPENROUTER_API_KEY
+const OPENROUTER_MODEL=process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free'
+const OPENROUTER_URL='https://openrouter.ai/api/v1/chat/completions'
+
+const cache=new Map()
+const CACHE_TTL_MS=1000*60*60*24
+
+function getCacheKey(str){
+    return str.toLowerCase().trim().replace(/\s+/g, ' ')
 }
 
-// Формируем номер дома / участка из полей DaData
-function formatHouse(data) {
-    const parts = [];
-    if (data.house_type && data.house) {
-        parts.push(`${data.house_type} ${data.house}`);
-    } else if (data.house) {
-        parts.push(data.house);
+function getCached(key){
+    const item=cache.get(key)
+    if (!item) return null
+    if (Date.now()>item.expiresAt){
+        cache.delete(key)
+        return null
     }
-    if (data.block) {
-        parts.push(`к${data.block}`);
-    }
-    if (data.structure) {
-        parts.push(`стр${data.structure}`);
-    }
-    if (data.building) {
-        parts.push(`с${data.building}`);
-    }
-    if (data.flat) {
-        parts.push(`кв${data.flat}`);
-    }
-    return parts.length ? parts.join(' ') : null;
+    return item.value
 }
 
-// Формируем регион: "Краснодарский край"
-function formatRegion(data) {
-    if (data.region_type && data.region) {
-        return `${data.region} ${data.region_type}`;
-    }
-    return data.region || null;
+function setCached(key, value){
+    cache.set(key, { value, expiresAt: Date.now()+CACHE_TTL_MS })
 }
 
-// Формируем город: "г Краснодар"
-function formatCity(data) {
-    if (data.city_type && data.city) {
-        return `${data.city_type} ${data.city}`;
-    }
-    return data.city || null;
+const SYSTEM_PROMPT=`Ты — сервис разбора российских почтовых адресов. Получаешь строку с адресом, возвращаешь ТОЛЬКО JSON-объект.
+
+Правила:
+1. Ответ — валидный JSON, без markdown (\`\`\`json), без пояснений, без текста вне JSON.
+2. Поля:
+   - "index": почтовый индекс (6 цифр), только если он ЯВНО указан в строке. Иначе null.
+   - "region": регион/субъект РФ с типом. Примеры: "Московская область", "Краснодарский край", "Республика Татарстан", "г Санкт-Петербург", "Еврейская автономная область", "Ханты-Мансийский автономный округ — Югра", "Чувашская Республика — Чувашия".
+   - "district": муниципальный район/улус/округ с типом. Примеры: "р-н Темрюкский", "улус Верхневилюйский", "г о Звенигород". Или null.
+   - "city": населённый пункт с типом. Это может быть город, посёлок, деревня, хутор, станица, село, ПГТ и т.д. Примеры: "г Москва", "п Восточный", "д Новинка", "с Ивановка", "пгт Красноармейский", "хутор Ленинский", "ст-ца Ленинградская", "рп Солнечный", "п Таманский".
+   - "street": улица с типом. Примеры: "ул Ленина", "пр-кт Мира", "б-р Победы", "пер Садовый", "ш Каширское", "наб Реки Фонтанки", "пл Революции", "тупик Красный", "ул Спортивная". Или null.
+   - "address": номер дома и квартира/офис в одной строке. Формат: "д 15 к 2 стр 3 кв 45" или "д 100 оф 20". Сокращения: д (дом), к (корпус), стр (строение), с (сооружение), кв (квартира), оф (офис), пом (помещение). Если номера нет — null.
+
+3. Если в строке нет индекса — поле index = null, даже если ты знаешь индекс этого адреса.
+4. Если адрес не содержит улицы (например, только деревня) — street = null.
+5. Если населённый пункт — город федерального значения (Москва, СПб, Севастополь), region = "г Москва" и city = "г Москва".
+6. Всегда включай тип в название: "г", "ул", "р-н", "п", "д", "с", "пгт", "ст-ца" и т.д.
+7. Если не уверен в каком-то поле — ставь null, не додумывай.
+
+Примеры:
+
+Вход: "123456, г Москва, ул Ленина, д 15, кв 45"
+{"index":"123456","region":"г Москва","district":null,"city":"г Москва","street":"ул Ленина","address":"д 15 кв 45"}
+
+Вход: "РОССИЯ, 353546, Краснодарский край, Темрюкский р-н, Таманский п, Спортивная ул, 5/1"
+{"index":"353546","region":"Краснодарский край","district":"р-н Темрюкский","city":"п Таманский","street":"ул Спортивная","address":"д 5/1"}
+
+Вход: "Краснодарский край, г Краснодар, ул Садовая, д 10"
+{"index":null,"region":"Краснодарский край","district":null,"city":"г Краснодар","street":"ул Садовая","address":"д 10"}
+
+Вход: "Московская область, р-н Одинцовский, п Восточный, д 5"
+{"index":null,"region":"Московская область","district":"р-н Одинцовский","city":"п Восточный","street":null,"address":"д 5"}
+
+Вход: "Республика Татарстан, г Казань, пр-кт Победы, д 100, к 1, оф 20"
+{"index":null,"region":"Республика Татарстан","district":null,"city":"г Казань","street":"пр-кт Победы","address":"д 100 к 1 оф 20"}
+
+Вход: "ул Пушкина, д 10, кв 5, г Самара"
+{"index":null,"region":null,"district":null,"city":"г Самара","street":"ул Пушкина","address":"д 10 кв 5"}
+
+Вход: "420000, Республика Татарстан, г Казань, ул Баумана, д 1"
+{"index":"420000","region":"Республика Татарстан","district":null,"city":"г Казань","street":"ул Баумана","address":"д 1"}
+
+Вход: "д Новинка, с Ивановка, Костромская область"
+{"index":null,"region":"Костромская область","district":null,"city":"с Ивановка","street":null,"address":null}
+
+Вход: "г Звенигород, Московская область, ул Мира, д 1"
+{"index":null,"region":"Московская область","district":null,"city":"г Звенигород","street":"ул Мира","address":"д 1"}
+
+Вход: "197022, г Санкт-Петербург, наб Реки Фонтанки, д 1"
+{"index":"197022","region":"г Санкт-Петербург","district":null,"city":"г Санкт-Петербург","street":"наб Реки Фонтанки","address":"д 1"}`;
+
+function hasIndex(input){
+    return /(?<!\d)\d{5,6}(?!\d)/.test(input.trim())
 }
 
-// --- Эндпоинт ---
-app.post('/break-address', async (req, res) => {
-    const { str } = req.body;
+function extractIndexFromString(input){
+    const match=input.match(/(?<!\d)\d{5,6}(?!\d)/)
+    return match ? match[0] : null
+}
 
-    if (!str) {
-        return res.status(400).json({ error: 'Missing "str" field' });
+function extractJson(text){
+    if (!text) throw new Error('Empty response from AI')
+    let cleaned=text
+        .replace(/```json\s*/gi, '')
+        .replace(/```\s*/gi, '')
+        .trim()
+    const match=cleaned.match(/\{[\s\S]*\}/)
+    if (!match) throw new Error('No JSON object found in response')
+    return JSON.parse(match[0])
+}
+
+function validateResult(obj){
+    const required=['index', 'region', 'district', 'city', 'street', 'address']
+    for (const key of required){
+        if (!(key in obj)) throw new Error(`Missing field: ${key}`)
+        if (obj[key]!==null && typeof obj[key]!=='string'){
+            obj[key]=String(obj[key])
+        }
     }
+    return obj
+}
 
-    if (!DADATA_API_KEY || !DADATA_SECRET_KEY) {
-        console.error('DaData API keys are not set in .env');
-        return res.status(500).json({ error: 'Server configuration error' });
-    }
+async function callMistral(address){
+    if (!MISTRAL_API_KEY) throw new Error('MISTRAL_API_KEY not set')
 
-    try {
-        const response = await axios.post(
-            DADATA_URL,
-            [str],
-            {
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Token ${DADATA_API_KEY}`,
-                    'X-Secret': DADATA_SECRET_KEY,
+    const response=await axios.post(
+        MISTRAL_URL,
+        {
+            model: MISTRAL_MODEL,
+            messages: [
+                { role: 'system', content: SYSTEM_PROMPT },
+                { role: 'user', content: `Разбери адрес: "${address}"` }
+            ],
+            temperature: 0.05,
+            max_tokens: 512,
+            response_format: { type: 'json_object' },
+        },
+        {
+            headers: {
+                'Authorization': `Bearer ${MISTRAL_API_KEY}`,
+                'Content-Type': 'application/json',
+            },
+            timeout: 15000,
+        }
+    )
+
+    return extractJson(response.data?.choices?.[0]?.message?.content)
+}
+
+async function callOpenRouter(address){
+    if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY not set')
+
+    const response=await axios.post(
+        OPENROUTER_URL,
+        {
+            model: OPENROUTER_MODEL,
+            messages: [
+                { role: 'system', content: SYSTEM_PROMPT },
+                { role: 'user', content: `Разбери адрес: "${address}"` }
+            ],
+            temperature: 0.05,
+            max_tokens: 512,
+        },
+        {
+            headers: {
+                'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+                'Content-Type': 'application/json',
+                'HTTP-Referer': 'http://localhost:5000',
+                'X-Title': 'Address Parser',
+            },
+            timeout: 15000,
+        }
+    );
+
+    return extractJson(response.data?.choices?.[0]?.message?.content)
+}
+
+async function parseAddress(str, maxRetries=3){
+    const cacheKey=getCacheKey(str)
+    const cached=getCached(cacheKey)
+    if (cached) return cached
+
+    const includeIndex=hasIndex(str)
+    const extractedIndex=extractIndexFromString(str)
+
+    const providers=AI_PROVIDER==='openrouter'
+        ? ['openrouter', 'mistral']
+        : ['mistral', 'openrouter']
+
+    let lastError=null
+
+    for (const provider of providers){
+        for (let i=0; i<maxRetries; i++){
+            try{
+                let result=provider==='mistral'
+                    ? await callMistral(str)
+                    : await callOpenRouter(str)
+
+                result=validateResult(result)
+
+                if (!includeIndex){
+                    result.index=null
+                } else if (!result.index && extractedIndex){
+                    result.index=extractedIndex
+                }
+
+                setCached(cacheKey, result)
+                return result
+
+            } catch (err){
+                lastError=err
+                console.error(`[${provider}] Attempt ${i+1} failed:`, err.message)
+                if (i<maxRetries-1){
+                    await new Promise(r=>setTimeout(r, 1000*Math.pow(2, i)))
                 }
             }
-        );
-
-        const data = response.data[0];
-        if (!data) {
-            return res.status(404).json({ error: 'Address not recognized' });
         }
-
-        // Индекс возвращаем только если он был в исходной строке
-        const includeIndex = hasIndex(str);
-
-        const result = {
-            index: includeIndex ? data.postal_code : null,
-            region: formatRegion(data),
-            district: data.area || null,
-            city: formatCity(data),
-            street: data.street || null,
-            address: formatHouse(data) // только номер / участок
-        };
-
-        res.json(result);
-
-    } catch (error) {
-        console.error('DaData API error:', error.response?.data || error.message);
-        res.status(500).json({ error: 'Failed to parse address' });
     }
-});
 
-app.listen(PORT, () => {
-    console.log(`App running on port ${PORT}`);
-});
+    throw new Error(`All providers failed. Last error: ${lastError?.message}`)
+}
+
+app.post('/break-address', async (req, res)=>{
+    const { str }=req.body
+
+    if (!str || typeof str!=='string'){
+        return res.status(400).json({ error: 'Missing or invalid "str" field' })
+    }
+
+    if (!MISTRAL_API_KEY && !OPENROUTER_API_KEY){
+        return res.status(500).json({
+            error: 'No AI provider configured. Set MISTRAL_API_KEY or OPENROUTER_API_KEY in .env'
+        })
+    }
+
+    try{
+        const result=await parseAddress(str)
+        res.json(result)
+    } catch (error){
+        console.error('Address parsing error:', error.message)
+        res.status(500).json({
+            error: 'Failed to parse address',
+            details: error.message,
+        })
+    }
+})
+
+app.listen(PORT, ()=>{
+    console.log(`🚀 App running on port ${PORT}`)
+    console.log(`🤖 Primary AI provider: ${AI_PROVIDER}`)
+    console.log(`   Mistral:    ${MISTRAL_API_KEY ? '✅' : '❌'} (${MISTRAL_MODEL})`)
+    console.log(`   OpenRouter: ${OPENROUTER_API_KEY ? '✅' : '❌'} (${OPENROUTER_MODEL})`)
+})
