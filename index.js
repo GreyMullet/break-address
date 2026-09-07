@@ -155,7 +155,7 @@ async function callMistral(address){
 }
 
 async function callOpenRouter(address){
-    if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY not set')
+    if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY not set');
 
     const response=await axios.post(
         OPENROUTER_URL,
@@ -163,10 +163,11 @@ async function callOpenRouter(address){
             model: OPENROUTER_MODEL,
             messages: [
                 { role: 'system', content: SYSTEM_PROMPT },
-                { role: 'user', content: 'Разбери адрес: "'+address+'"' }
+                { role: 'user', content: 'Разбери адрес: "' + address + '"' }
             ],
             temperature: 0.05,
-            max_tokens: 512
+            max_tokens: 512,
+            response_format: { type: 'json_object' }
         },
         {
             headers: {
@@ -179,7 +180,7 @@ async function callOpenRouter(address){
         }
     )
 
-    return extractJson(response.data?.choices?.[0]?.message?.content)
+    return extractJson(response.data?.choices?.[0]?.message?.content);
 }
 
 async function parseAddress(str, maxRetries=3){
