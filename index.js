@@ -2,6 +2,7 @@ require('dotenv').config()
 const path=require('path')
 const express=require('express')
 const axios=require('axios')
+const fs=require('fs')
 const { HttpsProxyAgent }=require('https-proxy-agent')
 
 const app=express()
@@ -23,6 +24,26 @@ const OPENROUTER_URL='https://openrouter.ai/api/v1/chat/completions'
 
 const cache=new Map()
 const CACHE_TTL_MS=1000*60*60*24
+
+let proxyList=[]
+
+function loadProxyList(){
+    try{
+        const filePath=path.join(__dirname, 'proxies.txt')
+        const data=fs.readFileSync(filePath, 'utf8')
+        proxyList=data
+            .split('\n')
+            .map(line=>line.trim())
+            .filter(line=>line.length>0)
+            .map(proxy=>'http://'+proxy)
+        console.log(`Loaded ${proxyList.length} proxies from proxies.txt`)
+    } catch (err){
+        console.warn('Could not load proxies.txt, using direct connection only')
+        proxyList=[]
+    }
+}
+
+loadProxyList()
 
 function getCacheKey(str){
     return str.toLowerCase().trim().replace(/\s+/g, ' ')
@@ -56,7 +77,7 @@ function extractJson(text){
     let cleaned=text
         .replace(/```json\s*/gi, '')
         .replace(/```\s*/gi, '')
-        .trim()
+        .trim();
     const match=cleaned.match(/\{[\s\S]*\}/)
     if (!match) throw new Error('No JSON object found in response')
     return JSON.parse(match[0])
@@ -126,10 +147,10 @@ const SYSTEM_PROMPT=`Ты — сервис разбора российских �
 {"index":"197022","region":"г Санкт-Петербург","district":null,"city":"г Санкт-Петербург","street":"наб Реки Фонтанки","address":"д 1","corpus":null,"flat":"кв 100"}
 
 Вход: "д 15, к 2, стр 3, кв 45"
-{"index":null,"region":null,"district":null,"city":null,"street":null,"address":"д 15","corpus":"к 2 стр 3","flat":"кв 45"}`
+{"index":null,"region":null,"district":null,"city":null,"street":null,"address":"д 15","corpus":"к 2 стр 3","flat":"кв 45"}`;
 
 async function callMistral(address){
-    if (!MISTRAL_API_KEY) throw new Error('MISTRAL_API_KEY not set')
+    if (!MISTRAL_API_KEY) throw new Error('MISTRAL_API_KEY not set');
 
     const response=await axios.post(
         MISTRAL_URL,
@@ -158,34 +179,54 @@ async function callMistral(address){
 async function callOpenRouter(address){
     if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY not set')
 
-    const proxyUrl='http://165.154.162.73:8888'
-    const proxyAgent=new HttpsProxyAgent(proxyUrl)
+    const proxiesToTry=proxyList.length>0 ? proxyList : [''];
 
-    const response=await axios.post(
-        OPENROUTER_URL,
-        {
-            model: OPENROUTER_MODEL,
-            messages: [
-                { role: 'system', content: SYSTEM_PROMPT },
-                { role: 'user', content: 'Разбери адрес: "' + address + '"' }
-            ],
-            temperature: 0.05,
-            max_tokens: 512,
-            response_format: { type: 'json_object' }
-        },
-        {
-            headers: {
-                'Authorization': 'Bearer '+OPENROUTER_API_KEY,
-                'Content-Type': 'application/json',
-                'HTTP-Referer': 'http://localhost:5000',
-                'X-Title': 'Address Parser'
-            },
-            httpsAgent: proxyAgent,
-            timeout: 15000
+    let lastError=null
+
+    for (const proxyUrl of proxiesToTry){
+        try{
+            let proxyAgent=null
+            if (proxyUrl){
+                proxyAgent=new HttpsProxyAgent(proxyUrl)
+                console.log(`Trying proxy: ${proxyUrl}`)
+            } else{
+                console.log('Trying direct connection (no proxy)')
+            }
+
+            const response=await axios.post(
+                OPENROUTER_URL,
+                {
+                    model: OPENROUTER_MODEL,
+                    messages: [
+                        { role: 'system', content: SYSTEM_PROMPT },
+                        { role: 'user', content: 'Разбери адрес: "' + address + '"' }
+                    ],
+                    temperature: 0.05,
+                    max_tokens: 512,
+                    response_format: { type: 'json_object' }
+                },
+                {
+                    headers: {
+                        'Authorization': 'Bearer '+OPENROUTER_API_KEY,
+                        'Content-Type': 'application/json',
+                        'HTTP-Referer': 'http://localhost:5000',
+                        'X-Title': 'Address Parser'
+                    },
+                    httpsAgent: proxyAgent,
+                    timeout: 15000
+                }
+            )
+
+            console.log(`Proxy ${proxyUrl || 'direct'} succeeded`)
+            return extractJson(response.data?.choices?.[0]?.message?.content)
+
+        } catch (err){
+            lastError=err
+            console.error(`Proxy ${proxyUrl || 'direct'} failed:`, err.message)
         }
-    )
+    }
 
-    return extractJson(response.data?.choices?.[0]?.message?.content)
+    throw new Error(`All proxies failed. Last error: ${lastError?.message}`)
 }
 
 async function parseAddress(str, maxRetries=3){
@@ -205,7 +246,7 @@ async function parseAddress(str, maxRetries=3){
     for (const provider of providers){
         let attempt=0
         while (attempt<maxRetries){
-            try {
+            try{
                 let result=provider==='mistral'
                     ? await callMistral(str)
                     : await callOpenRouter(str)
@@ -248,7 +289,7 @@ app.post('/break-address', async (req, res)=>{
         })
     }
 
-    try {
+    try{
         const result=await parseAddress(str)
         res.json(result)
     } catch (error){
