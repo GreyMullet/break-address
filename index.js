@@ -2,6 +2,7 @@ require('dotenv').config()
 const path=require('path')
 const express=require('express')
 const axios=require('axios')
+const { HttpsProxyAgent }=require('https-proxy-agent')
 
 const app=express()
 const PORT=process.env.PORT ?? 3000
@@ -155,7 +156,10 @@ async function callMistral(address){
 }
 
 async function callOpenRouter(address){
-    if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY not set');
+    if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY not set')
+
+    const proxyUrl='http://165.154.162.73:8888'
+    const proxyAgent=new HttpsProxyAgent(proxyUrl)
 
     const response=await axios.post(
         OPENROUTER_URL,
@@ -176,11 +180,12 @@ async function callOpenRouter(address){
                 'HTTP-Referer': 'http://localhost:5000',
                 'X-Title': 'Address Parser'
             },
+            httpsAgent: proxyAgent,
             timeout: 15000
         }
     )
 
-    return extractJson(response.data?.choices?.[0]?.message?.content);
+    return extractJson(response.data?.choices?.[0]?.message?.content)
 }
 
 async function parseAddress(str, maxRetries=3){
